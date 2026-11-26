@@ -27,6 +27,18 @@ interface DecryptedRoomMessage {
   direction: 'inbound' | 'outbound';
   plaintext: string;
   createdAt: number;
+  /** True when the backend pushed an edit for this message. */
+  edited?: boolean;
+  /** True when the edited ciphertext failed to decrypt; original text is kept. */
+  decryptFailed?: boolean;
+}
+
+/** Shape of the `message_edited` payload emitted by the backend. */
+interface MessageEditedEvent {
+  id: string;
+  senderKeyId: string;
+  recipientKeyId: string;
+  payload: EncryptedP2PMessage;
 }
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:1234';
@@ -156,6 +168,84 @@ export function EncryptedRoomChat({ roomId }: { roomId: string }) {
       doc.destroy();
     };
   }, [roomId]);
+
+  // Handle message_edited events pushed by the backend over the same
+  // y-websocket connection. The backend broadcasts { type: 'message_edited', ... }
+  // as a JSON frame on top of the Yjs protocol; we parse it here.
+  useEffect(() => {
+    // The WebsocketProvider's .ws property is the underlying native WebSocket.
+    // We wait until it's available; if the provider reconnects, the observer
+    // callback added below fires again and re-wires the listener.
+    const provider = providerRef.current;
+    if (!provider) return;
+
+    const handleNativeMessage = async (event: MessageEvent) => {
+      if (typeof event.data !== 'string') return;
+      let parsed: { type?: string; data?: MessageEditedEvent } | null = null;
+      try {
+        parsed = JSON.parse(event.data as string);
+      } catch {
+        return;
+      }
+      if (parsed?.type !== 'message_edited') return;
+
+      const edited = parsed.data;
+      if (!edited?.id || !edited?.payload) return;
+
+      const ownIdentity = localIdentityRef.current;
+      if (!ownIdentity) return;
+
+      const isInbound = edited.recipientKeyId === ownIdentity.keyId;
+      const isOutbound = edited.senderKeyId === ownIdentity.keyId;
+      if (!isInbound && !isOutbound) return;
+
+      const identities = identitiesRef.current;
+      if (!identities) return;
+      const peerKeyId = isInbound ? edited.senderKeyId : edited.recipientKeyId;
+      const peerIdentity = identities.get(peerKeyId);
+      if (!peerIdentity) return;
+
+      try {
+        const plaintext = await decryptP2PMessage(peerIdentity, edited.payload);
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === edited.id
+              ? { ...m, plaintext, edited: true, decryptFailed: false }
+              : m
+          )
+        );
+      } catch {
+        // Decrypt failed: keep original plaintext, mark as unavailable.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === edited.id ? { ...m, edited: true, decryptFailed: true } : m
+          )
+        );
+      }
+    };
+
+    // Attach to the current WS socket and re-attach whenever the provider reconnects.
+    const attachListener = () => {
+      provider.ws?.addEventListener('message', handleNativeMessage);
+    };
+
+    const detachListener = () => {
+      provider.ws?.removeEventListener('message', handleNativeMessage);
+    };
+
+    attachListener();
+    provider.on('status', ({ status }: { status: string }) => {
+      if (status === 'connected') {
+        // Re-attach after each reconnect; the previous WS instance was replaced.
+        detachListener();
+        attachListener();
+      }
+    });
+
+    return () => {
+      detachListener();
+    };
+  }, []);
 
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.keyId === selectedPeerId),
@@ -329,7 +419,18 @@ export function EncryptedRoomChat({ roomId }: { roomId: string }) {
                     : 'bg-gray-100 text-gray-900 dark:bg-gray-800 dark:text-gray-100'
                 }`}
               >
-                <p className="whitespace-pre-wrap">{message.plaintext}</p>
+                {message.decryptFailed ? (
+                  <p className="whitespace-pre-wrap italic opacity-60">
+                    Message unavailable
+                  </p>
+                ) : (
+                  <p className="whitespace-pre-wrap">{message.plaintext}</p>
+                )}
+                {message.edited && (
+                  <span className="mt-1 block text-[11px] opacity-60">
+                    edited
+                  </span>
+                )}
               </div>
             </div>
           ))
